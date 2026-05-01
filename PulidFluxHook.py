@@ -29,8 +29,17 @@ def set_model_dit_patch_replace(model, patch_kwargs, key):
     else:
         to["patches_replace"]["dit"][key].add(pulid_patch, **patch_kwargs)
 
+
+def _run_pulid_ca(pulid_model, ca_idx, embedding, img):
+    pulid_module = pulid_model.model.pulid_ca[ca_idx].to(img.device)
+    module_dtype = next(pulid_module.parameters()).dtype
+    embedding = embedding.to(img.device, dtype=module_dtype)
+    img_for_pulid = img.to(img.device, dtype=module_dtype)
+    return pulid_module(embedding, img_for_pulid).to(img.dtype)
+
+
 def pulid_patch(img, pulid_model=None, ca_idx=None, weight=1.0, embedding=None, mask=None, transformer_options={}):
-    pulid_img = weight * pulid_model.model.pulid_ca[ca_idx].to(img.device)(embedding, img)
+    pulid_img = weight * _run_pulid_ca(pulid_model, ca_idx, embedding, img)
     if mask is not None:
         pulid_temp_attrs = transformer_options.get(PatchKeys.pulid_patch_key_attrs, {})
         latent_image_shape = pulid_temp_attrs.get("latent_image_shape", None)
@@ -244,6 +253,158 @@ def pulid_forward_orig(
     img = img[:, txt.shape[1]:, ...]
 
     img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
+
+    del transformer_options[PatchKeys.running_net_model]
+
+    return img
+
+
+def pulid_forward_orig_chroma(
+    self,
+    img: Tensor,
+    img_ids: Tensor,
+    txt: Tensor,
+    txt_ids: Tensor,
+    timesteps: Tensor,
+    guidance: Tensor = None,
+    control=None,
+    transformer_options={},
+    attn_mask: Tensor = None,
+    **kwargs,
+) -> Tensor:
+    patches_replace = transformer_options.get("patches_replace", {})
+
+    if img.ndim != 3 or txt.ndim != 3:
+        raise ValueError("Input img and txt tensors must have 3 dimensions.")
+
+    transformer_options[PatchKeys.running_net_model] = self
+
+    img = self.img_in(img)
+
+    mod_index_length = 344
+    distill_timestep = timestep_embedding(timesteps.detach().clone(), 16).to(img.device, img.dtype)
+    distil_guidance = timestep_embedding(guidance.detach().clone(), 16).to(img.device, img.dtype)
+
+    modulation_index = timestep_embedding(torch.arange(mod_index_length, device=img.device), 32).to(img.device, img.dtype)
+    modulation_index = modulation_index.unsqueeze(0).repeat(img.shape[0], 1, 1).to(img.device, img.dtype)
+    timestep_guidance = torch.cat([distill_timestep, distil_guidance], dim=1).unsqueeze(1).repeat(1, mod_index_length, 1).to(img.device, img.dtype)
+    input_vec = torch.cat([timestep_guidance, modulation_index], dim=-1).to(img.device, img.dtype)
+
+    mod_vectors = self.distilled_guidance_layer(input_vec)
+    txt = self.txt_in(txt)
+
+    ids = torch.cat((txt_ids, img_ids), dim=1)
+    pe = self.pe_embedder(ids)
+
+    blocks_replace = patches_replace.get("dit", {})
+
+    for i, block in enumerate(self.double_blocks):
+        key = ("double_block", i)
+        if i not in self.skip_mmdit:
+            double_mod = (
+                self.get_modulations(mod_vectors, "double_img", idx=i),
+                self.get_modulations(mod_vectors, "double_txt", idx=i),
+            )
+            if key in blocks_replace:
+                def block_wrap(args):
+                    out = {}
+                    out["img"], out["txt"] = block(img=args["img"],
+                                                   txt=args["txt"],
+                                                   vec=args["vec"],
+                                                   pe=args["pe"],
+                                                   attn_mask=args.get("attn_mask"))
+                    return out
+
+                out = blocks_replace[key]({"img": img,
+                                           "txt": txt,
+                                           "vec": double_mod,
+                                           "pe": pe,
+                                           "attn_mask": attn_mask},
+                                          {
+                                              "original_block": block_wrap,
+                                              "transformer_options": transformer_options,
+                                          })
+                txt = out["txt"]
+                img = out["img"]
+            else:
+                img, txt = block(img=img,
+                                 txt=txt,
+                                 vec=double_mod,
+                                 pe=pe,
+                                 attn_mask=attn_mask)
+
+            if control is not None:
+                control_i = control.get("input")
+                if i < len(control_i):
+                    add = control_i[i]
+                    if add is not None:
+                        img += add
+        elif key in blocks_replace:
+            def block_wrap(args):
+                return {"img": args["img"], "txt": args["txt"]}
+
+            out = blocks_replace[key]({"img": img,
+                                       "txt": txt,
+                                       "vec": None,
+                                       "pe": pe,
+                                       "attn_mask": attn_mask},
+                                      {
+                                          "original_block": block_wrap,
+                                          "transformer_options": transformer_options,
+                                      })
+            txt = out["txt"]
+            img = out["img"]
+
+    img = torch.cat((txt, img), 1)
+
+    for i, block in enumerate(self.single_blocks):
+        key = ("single_block", i)
+        if i not in self.skip_dit:
+            single_mod = self.get_modulations(mod_vectors, "single", idx=i)
+            if key in blocks_replace:
+                def block_wrap(args):
+                    out = {}
+                    out["img"] = block(args["img"],
+                                       vec=args["vec"],
+                                       pe=args["pe"],
+                                       attn_mask=args.get("attn_mask"))
+                    return out
+
+                out = blocks_replace[key]({"img": img,
+                                           "vec": single_mod,
+                                           "pe": pe,
+                                           "attn_mask": attn_mask},
+                                          {
+                                              "original_block": block_wrap,
+                                              "transformer_options": transformer_options,
+                                          })
+                img = out["img"]
+            else:
+                img = block(img, vec=single_mod, pe=pe, attn_mask=attn_mask)
+
+            if control is not None:
+                control_o = control.get("output")
+                if i < len(control_o):
+                    add = control_o[i]
+                    if add is not None:
+                        img[:, txt.shape[1]:, ...] += add
+        elif key in blocks_replace:
+            def block_wrap(args):
+                return {"img": args["img"]}
+
+            out = blocks_replace[key]({"img": img,
+                                       "vec": None,
+                                       "pe": pe,
+                                       "attn_mask": attn_mask},
+                                      {
+                                          "original_block": block_wrap,
+                                          "transformer_options": transformer_options,
+                                      })
+            img = out["img"]
+
+    img = img[:, txt.shape[1]:, ...]
+    final_mod = self.get_modulations(mod_vectors, "final")
+    img = self.final_layer(img, vec=final_mod)
 
     del transformer_options[PatchKeys.running_net_model]
 
