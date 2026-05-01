@@ -1,8 +1,14 @@
+## Adapted for Chroma
+
 Same as base only replaced Flux model support with Chroma model support.
 
-Still experimental.
+### Still experimental.
 
 Many thanks to [ComfyUI-PuLID-Flux-Chroma](https://github.com/PaoloC68/ComfyUI-PuLID-Flux-Chroma ).
+
+
+--------------
+--------------
 
 [中文文档](README_CN.md)
 
