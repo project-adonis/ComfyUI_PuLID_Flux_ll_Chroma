@@ -1,4 +1,4 @@
-Same is base only replaced Flux model support with Chroma model support.
+Same as base only replaced Flux model support with Chroma model support.
 
 Still experimental.
 
