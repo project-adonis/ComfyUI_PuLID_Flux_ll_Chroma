@@ -1,3 +1,9 @@
+Same is base only replaced Flux model support with Chroma model support.
+
+Still experimental.
+
+Many thanks to [ComfyUI-PuLID-Flux-Chroma](https://github.com/PaoloC68/ComfyUI-PuLID-Flux-Chroma ).
+
 [中文文档](README_CN.md)
 
 - Solved [ComfyUI-PuLID-Flux](https://github.com/balazik/ComfyUI-PuLID-Flux) model pollution problem.
